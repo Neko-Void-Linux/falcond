@@ -1,19 +1,21 @@
-//! Idle inhibitor with busctl D-Bus + systemd-inhibit fallback.
+//! Idle inhibitor with native D-Bus + systemd-inhibit.
 //!
-//! Uses busctl to call org.freedesktop.ScreenSaver.Inhibit on the
-//! target user's session bus (via sudo when running as root),
-//! with systemd-inhibit as a fallback.
+//! A helper process keeps the target user's D-Bus connection alive for the
+//! full inhibition lifetime. systemd-inhibit provides independent coverage.
 
 const std = @import("std");
+const linux = std.os.linux;
 const posix = std.posix;
 const otter_utils = @import("otter_utils");
+const Screensaver = @import("otter_desktop").Screensaver;
 const scanner = @import("scanner.zig");
 const log = std.log.scoped(.inhibitor);
 
 const Self = @This();
+pub const helper_arg = "--screensaver-inhibit-helper";
 
 allocator: std.mem.Allocator,
-dbus_cookie: ?u32 = null,
+dbus_process: ?std.process.Child = null,
 target_uid: ?u32 = null,
 systemd_pid: ?posix.pid_t = null,
 
@@ -32,12 +34,12 @@ pub fn inhibit(self: *Self, app_name: []const u8, reason: []const u8, pid: u32) 
         self.target_uid = scanner.findUserForProcess(pid);
     }
 
-    if (self.dbus_cookie == null) {
-        if (self.inhibitDBus(app_name, reason)) |cookie| {
-            self.dbus_cookie = cookie;
+    if (self.dbus_process == null) {
+        if (self.inhibitDBus(app_name, reason)) |child| {
+            self.dbus_process = child;
             any_success = true;
         } else |err| {
-            log.warn("busctl screensaver inhibit failed: {}", .{err});
+            log.warn("D-Bus screensaver inhibit failed: {}", .{err});
         }
     } else {
         any_success = true;
@@ -45,7 +47,7 @@ pub fn inhibit(self: *Self, app_name: []const u8, reason: []const u8, pid: u32) 
 
     if (self.systemd_pid == null) {
         self.inhibitLogin1(app_name, reason) catch |err| {
-            log.warn("systemd-inhibit fallback failed: {}", .{err});
+            log.warn("systemd-inhibit failed: {}", .{err});
         };
         if (self.systemd_pid != null) {
             any_success = true;
@@ -58,13 +60,18 @@ pub fn inhibit(self: *Self, app_name: []const u8, reason: []const u8, pid: u32) 
 }
 
 pub fn uninhibit(self: *Self) void {
-    if (self.dbus_cookie) |cookie| {
-        if (self.uninhibitDBus(cookie)) |_| {
-            self.dbus_cookie = null;
-        } else |err| {
-            log.warn("busctl screensaver uninhibit failed: {}", .{err});
-            // Keep cookie so a later uninhibit (or deinit) can retry.
+    if (self.dbus_process) |*child| {
+        if (child.id) |pid| {
+            posix.kill(pid, posix.SIG.TERM) catch |err| {
+                if (err != error.ProcessNotFound) {
+                    log.warn("failed to stop D-Bus inhibit helper {d}: {}", .{ pid, err });
+                }
+            };
         }
+        _ = child.wait(otter_utils.io.get()) catch |err| {
+            log.warn("failed to reap D-Bus inhibit helper: {}", .{err});
+        };
+        self.dbus_process = null;
     }
 
     if (self.systemd_pid) |pid| {
@@ -79,79 +86,20 @@ pub fn uninhibit(self: *Self) void {
         self.systemd_pid = null;
     }
 
-    // Only clear target_uid once D-Bus cookie is gone (needed for retry).
-    if (self.dbus_cookie == null) {
-        self.target_uid = null;
-    }
+    self.target_uid = null;
 }
 
 pub fn isInhibited(self: *const Self) bool {
-    return self.dbus_cookie != null or self.systemd_pid != null;
+    return self.dbus_process != null or self.systemd_pid != null;
 }
 
-// ── D-Bus via busctl ────────────────────────────────────────────────────
+// ── D-Bus ───────────────────────────────────────────────────────────────
 
-fn inhibitDBus(self: *Self, app_name: []const u8, reason: []const u8) !u32 {
+fn inhibitDBus(self: *Self, app_name: []const u8, reason: []const u8) !std.process.Child {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-
-    // Root can't access user session bus directly, so use sudo
-    if (posix.system.geteuid() == 0) {
-        const uid = self.target_uid orelse return error.NoTargetUser;
-        try argv.append(alloc, "sudo");
-        try argv.append(alloc, "-u");
-        try argv.append(alloc, try std.fmt.allocPrint(alloc, "#{d}", .{uid}));
-        try argv.append(alloc, "env");
-        try argv.append(alloc, try std.fmt.allocPrint(
-            alloc,
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{d}/bus",
-            .{uid},
-        ));
-    }
-
-    try argv.appendSlice(alloc, &.{
-        "busctl",
-        "--user",
-        "call",
-        "org.freedesktop.ScreenSaver",
-        "/org/freedesktop/ScreenSaver",
-        "org.freedesktop.ScreenSaver",
-        "Inhibit",
-        "ss",
-        app_name,
-        reason,
-    });
-
-    const result = try std.process.run(self.allocator, otter_utils.io.get(), .{
-        .argv = argv.items,
-        .stdout_limit = .limited(256),
-        .stderr_limit = .limited(256),
-    });
-    defer self.allocator.free(result.stdout);
-    defer self.allocator.free(result.stderr);
-
-    if (result.term != .exited or result.term.exited != 0) {
-        log.warn("busctl inhibit exited with {}", .{result.term});
-        return error.CommandFailed;
-    }
-
-    const stdout = std.mem.trim(u8, result.stdout, " \n\r\t");
-    const cookie = parseBusctlUint(stdout) orelse {
-        log.warn("failed to parse inhibit cookie from: '{s}'", .{stdout});
-        return error.ParseError;
-    };
-
-    log.info("screensaver inhibited (cookie={d}, uid={?})", .{ cookie, self.target_uid });
-    return cookie;
-}
-
-fn uninhibitDBus(self: *Self, cookie: u32) !void {
-    var arena = std.heap.ArenaAllocator.init(self.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    const io = otter_utils.io.get();
 
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
 
@@ -166,39 +114,60 @@ fn uninhibitDBus(self: *Self, cookie: u32) !void {
             "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{d}/bus",
             .{uid},
         ));
+        try argv.append(alloc, try std.fmt.allocPrint(alloc, "XDG_RUNTIME_DIR=/run/user/{d}", .{uid}));
     }
 
-    const cookie_str = try std.fmt.allocPrint(alloc, "{d}", .{cookie});
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_len = try std.Io.Dir.cwd().readLink(io, "/proc/self/exe", &exe_buf);
+    try argv.appendSlice(alloc, &.{ exe_buf[0..exe_len], helper_arg, app_name, reason });
 
-    try argv.appendSlice(alloc, &.{
-        "busctl",
-        "--user",
-        "call",
-        "org.freedesktop.ScreenSaver",
-        "/org/freedesktop/ScreenSaver",
-        "org.freedesktop.ScreenSaver",
-        "UnInhibit",
-        "u",
-        cookie_str,
-    });
-
-    const result = try std.process.run(self.allocator, otter_utils.io.get(), .{
+    var child = try std.process.spawn(io, .{
         .argv = argv.items,
-        .stdout_limit = .limited(0),
-        .stderr_limit = .limited(256),
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .inherit,
     });
-    defer self.allocator.free(result.stdout);
-    defer self.allocator.free(result.stderr);
+    errdefer child.kill(io);
 
-    if (result.term != .exited or result.term.exited != 0) {
-        log.warn("busctl uninhibit exited with {}", .{result.term});
-        return error.CommandFailed;
+    const stdout = child.stdout orelse return error.HelperFailed;
+    var ready: [1]u8 = undefined;
+    const n = stdout.readStreaming(io, &.{&ready}) catch 0;
+    stdout.close(io);
+    child.stdout = null;
+    if (n != 1 or ready[0] != 1) {
+        _ = try child.wait(io);
+        return error.HelperFailed;
     }
 
-    log.info("screensaver uninhibited (cookie {d})", .{cookie});
+    log.info("screensaver inhibited (helper={?d}, uid={?})", .{ child.id, self.target_uid });
+    return child;
 }
 
-// ── systemd-inhibit fallback ────────────────────────────────────────────
+pub fn runHelper(allocator: std.mem.Allocator, app_name: [:0]const u8, reason: [:0]const u8) !void {
+    var mask = posix.sigemptyset();
+    posix.sigaddset(&mask, posix.SIG.TERM);
+    posix.sigaddset(&mask, posix.SIG.INT);
+    posix.sigaddset(&mask, posix.SIG.HUP);
+    posix.sigprocmask(posix.SIG.BLOCK, &mask, null);
+
+    const parent = posix.getppid();
+    _ = try posix.prctl(.SET_PDEATHSIG, .{@as(usize, @intFromEnum(posix.SIG.TERM))});
+    if (posix.getppid() != parent) return;
+
+    const signal_fd = try posix.signalfd(-1, &mask, linux.SFD.CLOEXEC);
+    defer _ = posix.system.close(signal_fd);
+
+    var screensaver = try Screensaver.init(allocator);
+    defer screensaver.deinit();
+    _ = try screensaver.inhibit(app_name, reason);
+    try std.Io.File.stdout().writeStreamingAll(otter_utils.io.get(), &.{1});
+
+    var info: linux.signalfd_siginfo = undefined;
+    const n = try posix.read(signal_fd, std.mem.asBytes(&info));
+    if (n != @sizeOf(linux.signalfd_siginfo)) return error.ShortRead;
+}
+
+// ── systemd-inhibit ─────────────────────────────────────────────────────
 
 fn inhibitLogin1(self: *Self, app_name: []const u8, reason: []const u8) !void {
     const who_arg = try std.fmt.allocPrint(self.allocator, "--who={s}", .{app_name});
@@ -225,13 +194,4 @@ fn inhibitLogin1(self: *Self, app_name: []const u8, reason: []const u8) !void {
     });
     self.systemd_pid = child.id;
     log.info("started systemd-inhibit (pid {?d})", .{child.id});
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-/// Parse busctl's "u <cookie>" response format.
-fn parseBusctlUint(output: []const u8) ?u32 {
-    const trimmed = std.mem.trim(u8, output, "u ");
-    const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
-    return std.fmt.parseInt(u32, trimmed[0..end], 10) catch null;
 }

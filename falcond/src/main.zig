@@ -1,5 +1,6 @@
 const std = @import("std");
 const Daemon = @import("daemon.zig");
+const Inhibitor = @import("inhibitor.zig");
 const config_mod = @import("config.zig");
 const builtin = @import("builtin");
 const otter_utils = @import("otter_utils");
@@ -98,7 +99,15 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.skip(); // argv[0]
 
-    var oneshot = false;
+    const first_arg = args.next();
+    if (first_arg != null and std.mem.eql(u8, first_arg.?, Inhibitor.helper_arg)) {
+        const app_name = args.next() orelse return error.MissingHelperAppName;
+        const reason = args.next() orelse return error.MissingHelperReason;
+        try Inhibitor.runHelper(allocator, app_name, reason);
+        return;
+    }
+
+    var oneshot = first_arg != null and std.mem.eql(u8, first_arg.?, "--oneshot");
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--oneshot")) {
             oneshot = true;
