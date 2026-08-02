@@ -14,8 +14,17 @@ const log = std.log.scoped(.inhibitor);
 const Self = @This();
 pub const helper_arg = "--screensaver-inhibit-helper";
 
+const stop_timeout_ms: u32 = 500;
+const stop_poll_ms: u32 = 10;
+
+/// Helper → parent handshake: magic byte then the helper's own pid.
+const handshake_magic: u8 = 1;
+const handshake_len = 5;
+
 allocator: std.mem.Allocator,
 dbus_process: ?std.process.Child = null,
+/// The helper itself, which under root is a grandchild behind `sudo`.
+dbus_helper_pid: ?posix.pid_t = null,
 target_uid: ?u32 = null,
 systemd_pid: ?posix.pid_t = null,
 
@@ -61,32 +70,65 @@ pub fn inhibit(self: *Self, app_name: []const u8, reason: []const u8, pid: u32) 
 
 pub fn uninhibit(self: *Self) void {
     if (self.dbus_process) |*child| {
-        if (child.id) |pid| {
-            posix.kill(pid, posix.SIG.TERM) catch |err| {
-                if (err != error.ProcessNotFound) {
-                    log.warn("failed to stop D-Bus inhibit helper {d}: {}", .{ pid, err });
-                }
-            };
+        const wrapper_pid = child.id;
+        // Under root the helper is a grandchild behind sudo: TERM it directly so
+        // it releases the inhibit, after which sudo exits on its own. Only the
+        // wrapper is ours to reap.
+        if (self.dbus_helper_pid) |helper| {
+            if (wrapper_pid == null or wrapper_pid.? != helper) {
+                termPid(helper, "D-Bus inhibit helper");
+            }
         }
-        _ = child.wait(otter_utils.io.get()) catch |err| {
-            log.warn("failed to reap D-Bus inhibit helper: {}", .{err});
-        };
+        if (wrapper_pid) |pid| stopChild(pid, "D-Bus inhibit helper");
         self.dbus_process = null;
+        self.dbus_helper_pid = null;
     }
 
     if (self.systemd_pid) |pid| {
-        // SIGKILL because SIGTERM is blocked (inherited from signalfd mask)
+        // Straight to SIGKILL: systemd-inhibit inherited our blocked SIGTERM,
+        // so a TERM would only stall until stopChild's timeout.
         posix.kill(pid, posix.SIG.KILL) catch |err| {
             if (err != error.ProcessNotFound) {
                 log.warn("failed to kill systemd-inhibit pid {d}: {}", .{ pid, err });
             }
         };
-        var status: c_int = 0;
-        _ = std.posix.system.waitpid(pid, &status, 0);
+        _ = reap(pid, 0);
         self.systemd_pid = null;
     }
 
     self.target_uid = null;
+}
+
+/// Terminate and reap `pid`. Children inherit falcond's blocked SIGTERM (the
+/// signalfd mask), so a TERM can sit pending forever — never block in wait(),
+/// escalate to SIGKILL instead.
+fn stopChild(pid: posix.pid_t, what: []const u8) void {
+    termPid(pid, what);
+
+    var waited: u32 = 0;
+    while (waited < stop_timeout_ms) : (waited += stop_poll_ms) {
+        if (reap(pid, linux.W.NOHANG)) return;
+        const req = linux.timespec{ .sec = 0, .nsec = stop_poll_ms * std.time.ns_per_ms };
+        _ = linux.nanosleep(&req, null);
+    }
+
+    log.warn("{s} pid {d} ignored SIGTERM, killing", .{ what, pid });
+    posix.kill(pid, posix.SIG.KILL) catch {};
+    _ = reap(pid, 0);
+}
+
+fn termPid(pid: posix.pid_t, what: []const u8) void {
+    posix.kill(pid, posix.SIG.TERM) catch |err| {
+        if (err != error.ProcessNotFound) {
+            log.warn("failed to signal {s} pid {d}: {}", .{ what, pid, err });
+        }
+    };
+}
+
+fn reap(pid: posix.pid_t, flags: u32) bool {
+    var status: u32 = 0;
+    const rc = linux.waitpid(pid, &status, flags);
+    return @as(isize, @bitCast(rc)) == @as(isize, pid);
 }
 
 pub fn isInhibited(self: *const Self) bool {
@@ -127,20 +169,31 @@ fn inhibitDBus(self: *Self, app_name: []const u8, reason: []const u8) !std.proce
         .stdout = .pipe,
         .stderr = .inherit,
     });
-    errdefer child.kill(io);
+    errdefer if (child.id) |pid| stopChild(pid, "D-Bus inhibit helper");
 
     const stdout = child.stdout orelse return error.HelperFailed;
-    var ready: [1]u8 = undefined;
-    const n = stdout.readStreaming(io, &.{&ready}) catch 0;
+    var hello: [handshake_len]u8 = undefined;
+    const ok = readExact(io, stdout, &hello);
     stdout.close(io);
     child.stdout = null;
-    if (n != 1 or ready[0] != 1) {
-        _ = try child.wait(io);
-        return error.HelperFailed;
-    }
+    if (!ok or hello[0] != handshake_magic) return error.HelperFailed;
 
-    log.info("screensaver inhibited (helper={?d}, uid={?})", .{ child.id, self.target_uid });
+    // Signal the helper directly: under root `child` is sudo, which inherited
+    // our blocked SIGTERM and would never pass one along.
+    self.dbus_helper_pid = @bitCast(std.mem.readInt(u32, hello[1..5], .little));
+
+    log.info("screensaver inhibited (helper={?d}, uid={?})", .{ self.dbus_helper_pid, self.target_uid });
     return child;
+}
+
+fn readExact(io: std.Io, file: std.Io.File, buf: []u8) bool {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = file.readStreaming(io, &.{buf[filled..]}) catch return false;
+        if (n == 0) return false;
+        filled += n;
+    }
+    return true;
 }
 
 pub fn runHelper(allocator: std.mem.Allocator, app_name: [:0]const u8, reason: [:0]const u8) !void {
@@ -160,7 +213,11 @@ pub fn runHelper(allocator: std.mem.Allocator, app_name: [:0]const u8, reason: [
     var screensaver = try Screensaver.init(allocator);
     defer screensaver.deinit();
     _ = try screensaver.inhibit(app_name, reason);
-    try std.Io.File.stdout().writeStreamingAll(otter_utils.io.get(), &.{1});
+
+    var hello: [handshake_len]u8 = undefined;
+    hello[0] = handshake_magic;
+    std.mem.writeInt(u32, hello[1..5], @bitCast(@as(i32, posix.system.getpid())), .little);
+    try std.Io.File.stdout().writeStreamingAll(otter_utils.io.get(), &hello);
 
     var info: linux.signalfd_siginfo = undefined;
     const n = try posix.read(signal_fd, std.mem.asBytes(&info));
