@@ -12,8 +12,8 @@ short_desc="Advanced Linux Gaming Performance Daemon"
 maintainer="ferreo <ferreo@pika-os.com>"
 license="MIT"
 homepage="https://pika-os.com"
-distfiles="https://github.com/PikaOS-Linux/falcond/archive/v${version}.tar.gz"
-checksum=skip
+distfiles="https://github.com/Neko-Void-Linux/falcond/releases/download/2.0.14/falcond-2.0.14.tar.gz"
+checksum=cb13918088ef42cb57e452552046fa265ca9fc08184550226f283725b944f984
 
 do_fetch() {
     git clone --depth 1 https://github.com/PikaOS-Linux/falcond-profiles.git ${wrksrc}/profiles
