@@ -1,0 +1,36 @@
+# Template file for falcond
+# Build with: xbps-src pkg falcond
+
+pkgname=falcond
+version=2.0.14
+revision=1
+build_style=zig
+hostmakedepends="git"
+makedepends=""
+depends="dbus sudo power-profiles-daemon scx"
+short_desc="Advanced Linux Gaming Performance Daemon"
+maintainer="ferreo <ferreo@pika-os.com>"
+license="MIT"
+homepage="https://pika-os.com"
+distfiles="https://github.com/PikaOS-Linux/falcond/archive/v${version}.tar.gz"
+checksum=skip
+
+do_fetch() {
+    git clone --depth 1 https://github.com/PikaOS-Linux/falcond-profiles.git ${wrksrc}/profiles
+}
+
+do_build() {
+    zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3
+}
+
+do_install() {
+    vbin zig-out/bin/falcond
+
+    vmkdir /usr/share/falcond
+    cp -r profiles/usr/share/falcond/* ${DESTDIR}/usr/share/falcond/
+
+    vmkdir /var/lib/falcond
+
+    # runit service
+    vinstall ${FILESDIR}/falcond/run 755 /etc/sv/falcond/run
+}
